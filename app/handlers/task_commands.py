@@ -1,7 +1,14 @@
 from __future__ import annotations
 from pathlib import Path
 
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.error import BadRequest
 from telegram.ext import (
     CommandHandler,
     ContextTypes,
@@ -12,6 +19,7 @@ from telegram.ext import (
 
 from app.security.auth import reject_unauthorized
 from app.services.platform_support import open_path_in_editor
+from app.services.project_opener import open_project
 from app.services.project_discovery import default_scan_roots, discover_projects
 from app.services.project_classifier import classify_project, load_rules
 from app.services.task_status import format_task_status, normalize_status, parse_task_id
@@ -27,6 +35,45 @@ def _project_label(project: dict[str, str], prefix: str = "") -> str:
     info = classify_project(project)
     name = project.get("name", "Unnamed")[:34]
     return f"{prefix}{info['emoji']} {name}"[:60]
+
+
+def _project_inline_keyboard(
+    projects: list[dict[str, str]],
+    page: int,
+    callback_prefix: str,
+    project_prefix: str,
+    refresh_callback: str,
+    cancel_callback: str,
+) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(projects) + PROJECTS_PER_PAGE - 1) // PROJECTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    page_projects = projects[page * PROJECTS_PER_PAGE : (page + 1) * PROJECTS_PER_PAGE]
+    keyboard = []
+    for start in range(0, len(page_projects), 3):
+        row = [
+            InlineKeyboardButton(
+                _project_label(project),
+                callback_data=f"{project_prefix}:{project['key']}",
+            )
+            for project in page_projects[start : start + 3]
+        ]
+        keyboard.append(row)
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("⬅️ Trước", callback_data=f"{callback_prefix}:{page-1}")
+        )
+    if page + 1 < total_pages:
+        nav.append(
+            InlineKeyboardButton("Sau ➡️", callback_data=f"{callback_prefix}:{page+1}")
+        )
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([
+        InlineKeyboardButton("🔄 Làm mới", callback_data=refresh_callback),
+        InlineKeyboardButton("✖️ Hủy", callback_data=cancel_callback),
+    ])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def _project_list_text(title: str, projects: list[dict[str, str]], page: int = 0) -> str:
@@ -191,7 +238,7 @@ def _project_reply_keyboard(projects, context):
     labels = {}
     row = []
     for index, project in enumerate(projects, 1):
-        label = f"{index}. {project.get('name', 'Unnamed')}"[:60]
+        label = f"{index}. {_project_label(project)}"[:60]
         labels[label] = index
         row.append(KeyboardButton(label))
         if len(row) == 3:
@@ -224,49 +271,161 @@ async def projects_select_start(
 async def open_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await reject_unauthorized(update, context):
         return
+
     projects = _discover(context)
     if not projects:
-        await update.effective_message.reply_text("Chưa tìm thấy dự án. Hãy chạy /scanprojects.")
-        return
-    if not context.args:
-        user = update.effective_user
-        project = (
-            _current_project(context, user.id, projects)
-            if user is not None
-            else None
-        )
-        if project is None:
-            await update.effective_message.reply_text(
-                _project_list_text("🖥️ MỞ DỰ ÁN TRONG IDE", projects)
-                + "\nChưa có dự án được chọn. Hãy chọn dự án bằng /projects "
-                  "hoặc dùng /open SỐ."
-            )
-            return
-    else:
-        try:
-            index = int(context.args[0]) - 1
-        except ValueError:
-            index = -1
-        if index < 0 or index >= len(projects):
-            await update.effective_message.reply_text(
-                "Số dự án không hợp lệ. Dùng /open để xem danh sách."
-            )
-            return
-        project = projects[index]
-    path = Path(project["path"]).expanduser().resolve()
-    try:
-        path.relative_to(Path.home().resolve())
-    except ValueError:
+        settings = context.application.bot_data.get("settings")
+        root_info = f" ({settings.project_scan_root})" if settings and str(settings.project_scan_root) != "__AUTO_DISCOVERY__" else ""
         await update.effective_message.reply_text(
-            "Đường dẫn nằm ngoài thư mục người dùng; từ chối mở."
+            f"Chưa tìm thấy dự án nào{root_info}.\n\n"
+            "Hãy kiểm tra quyền truy cập thư mục hoặc đặt `PROJECT_SCAN_ROOT` trong file `.env` "
+            "rồi chạy lại /scanprojects.",
         )
         return
-    if not path.is_dir():
-        await update.effective_message.reply_text("Thư mục dự án không còn tồn tại.")
+
+    # Direct open if user supplied argument: /open 1 or /open p0001
+    if context.args:
+        arg = context.args[0].strip()
+        project = None
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(projects):
+                project = projects[idx]
+        if not project:
+            project = next((p for p in projects if p.get("key") == arg), None)
+        if not project:
+            await update.effective_message.reply_text(
+                f"Không tìm thấy dự án tương ứng với '{arg}'. Gõ /open để chọn bằng nút bấm."
+            )
+            return
+
+        path = Path(project["path"]).expanduser().resolve()
+        if not path.is_dir():
+            await update.effective_message.reply_text("Thư mục dự án không còn tồn tại.")
+            return
+
+        settings = context.application.bot_data.get("settings")
+        editor = getattr(settings, "code_editor", "Cursor")
+        try:
+            open_project(path, editor)
+            if update.effective_user:
+                _remember_project(context, update.effective_user.id, project)
+            await update.effective_message.reply_text(
+                f"✅ Đã gửi yêu cầu mở dự án:\n📁 {project['name']}\n`{path}`",
+                parse_mode="Markdown",
+            )
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            await update.effective_message.reply_text(f"Không thể mở project: {exc}")
         return
-    settings = context.application.bot_data["settings"]
-    ok, message = open_path_in_editor(path, settings.code_editor)
-    await update.effective_message.reply_text(message if ok else f"Không mở được IDE: {message}")
+
+    # Interactive UI: Return InlineKeyboardMarkup with buttons
+    page = 0
+    total_pages = max(1, (len(projects) + PROJECTS_PER_PAGE - 1) // PROJECTS_PER_PAGE)
+    text = (
+        f"🖥️ MỞ DỰ ÁN TRONG IDE\n"
+        f"Tìm thấy {len(projects)} dự án. Trang {page + 1}/{total_pages}.\n"
+        "Bấm vào tên dự án bên dưới để mở trong Cursor:"
+    )
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=_project_inline_keyboard(
+            projects,
+            page,
+            callback_prefix="open_page",
+            project_prefix="open_project",
+            refresh_callback="open_refresh",
+            cancel_callback="open_project:__cancel__",
+        ),
+    )
+
+
+async def open_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    if await reject_unauthorized(update, context):
+        return
+
+    data = query.data or ""
+    if data == "open_refresh" or data.startswith("open_page:"):
+        projects = _discover(context)
+        if not projects:
+            await query.edit_message_text(
+                "Chưa tìm thấy dự án nào. Hãy chạy /scanprojects trước."
+            )
+            return
+        total_pages = max(1, (len(projects) + PROJECTS_PER_PAGE - 1) // PROJECTS_PER_PAGE)
+        if data == "open_refresh":
+            page = 0
+        else:
+            try:
+                page = int(data.split(":", 1)[1])
+            except (ValueError, IndexError):
+                page = 0
+        page = max(0, min(page, total_pages - 1))
+        text = (
+            f"🖥️ MỞ DỰ ÁN TRONG IDE\n"
+            f"Tìm thấy {len(projects)} dự án. Trang {page + 1}/{total_pages}.\n"
+            "Bấm vào tên dự án bên dưới để mở trong Cursor:"
+        )
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=_project_inline_keyboard(
+                    projects,
+                    page,
+                    callback_prefix="open_page",
+                    project_prefix="open_project",
+                    refresh_callback="open_refresh",
+                    cancel_callback="open_project:__cancel__",
+                ),
+            )
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+        return
+
+    if not data.startswith("open_project:"):
+        await query.edit_message_text("Yêu cầu không hợp lệ. Hãy chạy /open lại.")
+        return
+
+    project_key = data.partition(":")[2].strip()
+    if project_key == "__cancel__":
+        await query.edit_message_text("Đã hủy.")
+        return
+
+    projects = _discover(context)
+    project = next((p for p in projects if p.get("key") == project_key), None)
+    if not project:
+        await query.edit_message_text(
+            "Không còn tìm thấy dự án này trên máy. Hãy chạy /scanprojects hoặc /open lại."
+        )
+        return
+
+    path = Path(project["path"]).expanduser().resolve()
+    if not path.is_dir():
+        await query.edit_message_text(f"Thư mục dự án không còn tồn tại:\n{path}")
+        return
+
+    settings = context.application.bot_data.get("settings")
+    editor = getattr(settings, "code_editor", "Cursor")
+
+    try:
+        open_project(path, editor)
+        if update.effective_user:
+            _remember_project(context, update.effective_user.id, project)
+        await query.edit_message_text(
+            f"✅ Đã gửi yêu cầu mở dự án trong {editor}.\n"
+            f"📁 {project['name']}\n"
+            f"`{path}`",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await query.edit_message_text(
+            f"Không thể mở project ({type(exc).__name__}): {exc}"
+        )
 
 
 
@@ -596,7 +755,7 @@ async def clear_history_command(update, context):
     for key in keys:
         context.user_data.pop(key, None)
 
-    await reply_text(
-        update,
-        "Đã xóa lịch sử hội thoại đang lưu trong phiên hiện tại."
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Đã xóa lịch sử hội thoại đang lưu trong phiên hiện tại."
+        )

@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from app.services.platform_paths import get_default_scan_roots, is_root_dir
 from app.services.platform_support import iter_preferred_scan_roots
 
 PROJECT_MARKERS = {
@@ -36,7 +37,7 @@ def _has_marker(directory: Path) -> bool:
 
 def default_scan_roots() -> list[Path]:
     home = Path.home()
-    roots = list(iter_preferred_scan_roots(home))
+    roots = list(get_default_scan_roots(home))
     try:
         for child in home.iterdir():
             if not child.is_dir() or child.name.startswith(".") or child.name in SKIP_DIRS:
@@ -51,7 +52,7 @@ def default_scan_roots() -> list[Path]:
             resolved = str(p.resolve())
         except OSError:
             continue
-        if resolved not in seen:
+        if resolved not in seen and not is_root_dir(Path(resolved)):
             seen.add(resolved)
             result.append(Path(resolved))
     return result
@@ -66,7 +67,7 @@ def discover_projects(roots: list[Path] | None = None, max_depth: int = 12,
             root = root.expanduser().resolve()
         except OSError:
             continue
-        if not root.exists() or not root.is_dir():
+        if not root.exists() or not root.is_dir() or is_root_dir(root):
             continue
         for current, dirs, _files in os.walk(root, topdown=True, followlinks=False):
             current_path = Path(current)

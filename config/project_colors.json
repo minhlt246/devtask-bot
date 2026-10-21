@@ -1,0 +1,94 @@
+{
+  "rules": [
+    {
+      "id": "wordpress_php",
+      "label": "WordPress / PHP",
+      "emoji": "🔵",
+      "color": "#21759b",
+      "markers": ["wp-config.php", "composer.json"],
+      "extensions": [".php"],
+      "name_contains": ["wordpress", "wp", "php"]
+    },
+    {
+      "id": "flutter_dart",
+      "label": "Flutter / Dart",
+      "emoji": "🔴",
+      "color": "#02569b",
+      "markers": ["pubspec.yaml", ".metadata"],
+      "extensions": [".dart"],
+      "name_contains": ["flutter", "dart"]
+    },
+    {
+      "id": "typescript",
+      "label": "TypeScript",
+      "emoji": "🔷",
+      "color": "#3178c6",
+      "markers": ["tsconfig.json"],
+      "extensions": [".ts", ".tsx"],
+      "name_contains": ["typescript", "ts"]
+    },
+    {
+      "id": "javascript_node",
+      "label": "JavaScript / Node",
+      "emoji": "🟡",
+      "color": "#f7df1e",
+      "markers": ["package.json", "yarn.lock", "pnpm-workspace.yaml"],
+      "extensions": [".js", ".jsx", ".mjs"],
+      "name_contains": ["javascript", "node", "js"]
+    },
+    {
+      "id": "python",
+      "label": "Python",
+      "emoji": "🐍",
+      "color": "#3776ab",
+      "markers": ["pyproject.toml", "requirements.txt", "Pipfile", "setup.py"],
+      "extensions": [".py"],
+      "name_contains": ["python", "py", "bot", "django", "flask", "fastapi"]
+    },
+    {
+      "id": "java",
+      "label": "Java",
+      "emoji": "☕",
+      "color": "#f89820",
+      "markers": ["pom.xml", "build.gradle", "settings.gradle"],
+      "extensions": [".java"],
+      "name_contains": ["java", "spring"]
+    },
+    {
+      "id": "golang",
+      "label": "Go",
+      "emoji": "🐬",
+      "color": "#00add8",
+      "markers": ["go.mod", "go.sum"],
+      "extensions": [".go"],
+      "name_contains": ["go", "golang"]
+    },
+    {
+      "id": "rust",
+      "label": "Rust",
+      "emoji": "🦀",
+      "color": "#dea584",
+      "markers": ["Cargo.toml", "Cargo.lock"],
+      "extensions": [".rs"],
+      "name_contains": ["rust"]
+    },
+    {
+      "id": "csharp_dotnet",
+      "label": "C# / .NET",
+      "emoji": "🟣",
+      "color": "#512bd4",
+      "markers": ["*.sln", "*.csproj"],
+      "extensions": [".cs", ".sln", ".csproj"],
+      "name_contains": ["dotnet", "csharp"]
+    },
+    {
+      "id": "generic",
+      "label": "Chưa xác định",
+      "emoji": "⚪",
+      "color": "#777777",
+      "markers": [],
+      "extensions": [],
+      "name_contains": []
+    }
+  ]
+}

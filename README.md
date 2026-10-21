@@ -75,12 +75,12 @@ DevTask Bot là trợ lý lập trình cá nhân qua Telegram. Người dùng đ
 
 | Item | English | Tiếng Việt |
 |---|---|---|
-| Menu `projectbuttons` | Listed in Telegram command menu, **no handler registered** | Có trong menu nhưng **chưa có handler** |
-| `/clearhistory` | Registered, but calls an undefined `reply_text` helper → runtime error if used | Đã đăng ký nhưng gọi helper không tồn tại → lỗi khi dùng |
-| Windows live run | Code + mocked tests only; no Windows host execution in this workspace | Chỉ code + test mock; chưa chạy host Windows tại đây |
-| `config/project_colors.json` | Classifier supports it; file may be absent (safe fallback) | Classifier hỗ trợ; file có thể thiếu (fallback an toàn) |
-| `config/projects.json` | Present but empty; discovery does not depend on it when auto-scan is on | File tồn tại nhưng rỗng; auto-scan không phụ thuộc file này |
-| Legacy statuses | Older DB rows may still say `SUCCEEDED` / `COMPLETED_WITH_WARNINGS`; `/status` normalizes display | Bản ghi cũ có thể còn status legacy; `/status` chuẩn hóa khi hiển thị |
+| Menu `projectbuttons` | Registered (`CommandHandler("projectbuttons", projects_select_start)`) | Đã đăng ký handler mở giao diện chọn nút bấm |
+| `/clearhistory` | Registered and functional | Đã sửa: xóa phiên hội thoại an toàn không crash |
+| Windows live run | Cross-platform code + 53 automated unit tests; live host execution unverified | Code đa nền tảng + 53 unit test tự động; chưa chạy host Windows thật |
+| `config/project_colors.json` | Default rule configuration present | Đã có cấu hình mặc định cho 10 công nghệ |
+| `config/projects.json` | Present (auto-scan used by default) | File tồn tại (auto-scan là mặc định) |
+| Legacy statuses | Older DB rows normalized by `/status` | Bản ghi cũ được `/status` chuẩn hóa khi hiển thị |
 | Linux | Unverified | Chưa xác minh |
 
 ### Known limitations / Giới hạn đã biết
@@ -89,8 +89,8 @@ DevTask Bot là trợ lý lập trình cá nhân qua Telegram. Người dùng đ
 - Agent can modify project files; there is no separate sandbox VM.
 - Test detection is heuristic and may skip unknown stacks.
 - `/cancel` accepts numeric IDs only (`1`), not `TASK-0001`.
-- No systemd/launchd unit is shipped; the bot runs in a foreground Terminal process unless you add your own service.
-- Repository currently has **no license file** and, in this workspace copy, is **not initialized as a Git repository**.
+- Background execution: macOS uses LaunchAgent (`com.devtask.bot`), Windows uses `scripts/start_bot.ps1` with Task Scheduler.
+- Repository currently has **no license file**.
 
 ---
 
@@ -183,9 +183,11 @@ devtask-bot/
 │   │   └── task_commands.py    # Telegram commands & conversations
 │   ├── services/
 │   │   ├── agent_worker.py     # Queue worker + agy integration
-│   │   ├── project_discovery.py
-│   │   ├── project_classifier.py
+│   │   ├── platform_paths.py   # Multi-platform scan roots resolution
 │   │   ├── platform_support.py # Cross-platform helpers
+│   │   ├── project_classifier.py
+│   │   ├── project_discovery.py
+│   │   ├── project_opener.py   # Cursor & IDE launcher for macOS/Windows
 │   │   └── task_status.py      # /status formatter
 │   ├── storage/
 │   │   └── database.py         # SQLite access
@@ -196,14 +198,19 @@ devtask-bot/
 │       ├── 02_task_execution.md
 │       └── 03_post_task_audit.md
 ├── config/
+│   ├── project_colors.json     # Tech classification and color rules
 │   └── projects.json           # Optional legacy project map (often empty)
 ├── scripts/
 │   ├── run_bot.sh              # macOS/Linux launcher
-│   └── run_bot.ps1             # Windows PowerShell launcher
+│   ├── run_bot.ps1             # Windows PowerShell launcher
+│   └── start_bot.ps1           # Windows background service launcher
 ├── tests/
 │   ├── conftest.py
-│   ├── test_task_status.py
-│   └── test_platform_support.py
+│   ├── test_open_project_buttons.py
+│   ├── test_platform_paths.py
+│   ├── test_platform_support.py
+│   ├── test_project_opener.py
+│   └── test_task_status.py
 ├── data/                       # Local DB + logs (gitignored)
 ├── requirements.txt
 ├── .env.example
@@ -439,7 +446,8 @@ Mọi lệnh dưới đây chỉ hoạt động với user ID nằm trong allow-
 | `/cancelinput` | `/cancelinput` | Abort in-progress create flow | — | `/cancelinput` | Flow cancelled | During conversation |
 | `/open` | `/open` or `/open <n>` | Open project in configured IDE | optional 1-based index | `/open 1` | Opened path confirmation | Uses `CODE_EDITOR`; Windows falls back to Explorer if CLI missing |
 | `/clear` | `/clear` | Explain that Telegram history must be cleared manually | — | `/clear` | Guidance message | Does **not** wipe SQLite |
-| `/clearhistory` | `/clearhistory` | Intended to clear in-memory session keys | — | `/clearhistory` | **Currently broken** (undefined helper) | Do not rely on it |
+| `/clearhistory` | `/clearhistory` | Clear in-memory session keys safely | — | `/clearhistory` | Session reset confirmation | Clears conversation state |
+| `/projectbuttons` | `/projectbuttons` | Project button selector | — | `/projectbuttons` | 3-column reply keyboard | Same as /projects |
 | `/refresh` | `/refresh` | Refresh project picker | — | (from picker keyboard) | New project keyboard | Inside project selection |
 | Plain text | any non-command text | Create follow-up task in last selected project | free text | `Add dark mode toggle` | New queued task if project remembered | Outside active conversation |
 
@@ -467,29 +475,39 @@ Mọi lệnh dưới đây chỉ hoạt động với user ID nằm trong allow-
 
 ### Overall statuses / Trạng thái tổng
 
-| Status | Meaning (EN) | Ý nghĩa (VI) |
-|---|---|---|
-| `QUEUED` | Waiting for worker | Đang chờ worker |
-| `RUNNING` | Claimed and executing | Đang thực thi |
-| `COMPLETED` | Finished with acceptable verification | Hoàn thành có xác minh chấp nhận được |
-| `PARTIAL` | Finished with warnings / incomplete verification / delivery issues | Xong nhưng cảnh báo / xác minh chưa đủ / lỗi gửi báo cáo |
-| `FAILED` | Hard failure or interrupted worker | Thất bại hoặc worker bị gián đoạn |
-| `BLOCKED` | Permission/tool blocking prevented completion | Bị chặn bởi quyền/công cụ |
-| `CANCELLED` | Cancelled while still queued | Đã hủy khi còn trong hàng đợi |
+| Biểu tượng | Trạng thái | Ý nghĩa (VI) | Meaning (EN) |
+|---|---|---|---|
+| 🟡 | `QUEUED` | Đang chờ trong hàng đợi SQLite, chưa có worker nhận. | Waiting in SQLite queue, not claimed by worker yet. |
+| 🔵 | `RUNNING` | Worker đang thực thi (chạy agent, test hoặc audit). | Worker executing (running agent, test, or audit). |
+| 🟢 | `COMPLETED` (hoặc `SUCCEEDED`) | Hoàn tất thành công toàn bộ, pass kiểm thử và audit. | Fully completed, passed all tests and audit. |
+| 🟠 | `PARTIAL` (hoặc `COMPLETED_WITH_WARNINGS`) | Đã chạy xong nhưng có cảnh báo: test fail, audit phát hiện lỗi P0/P1, hoặc không gửi được tin Telegram. | Finished with warnings: test failures, audit P0/P1 issues, or Telegram delivery failure. |
+| 🔴 | `FAILED` | Thất bại: agent báo lỗi, worker bị ngắt (kill/restart) hoặc timeout. | Hard failure: agent error, worker interrupted (killed/restarted), or timed out. |
+| ⚪ | `BLOCKED` | Bị chặn do thiếu quyền truy cập / công cụ bị từ chối trong headless mode. | Blocked due to missing permissions / tools rejected in headless mode. |
+| ⚫ | `CANCELLED` | Đã hủy bởi người dùng khi còn đang chờ (`QUEUED`). | Cancelled by user while still queued. |
 
-Legacy DB values `SUCCEEDED` and `COMPLETED_WITH_WARNINGS` are displayed as `COMPLETED` / `PARTIAL`.
+> [!TIP]
+> Nếu bạn muốn đổi biểu tượng của `PARTIAL` (ví dụ sang ⚠️, 🟨 hoặc màu khác), bạn có thể chỉnh sửa trực tiếp tại từ điển `STATUS_ICON` trong file [`app/services/task_status.py`](file:///Users/min/Desktop/devtask-bot/app/services/task_status.py).
+>
+> Bản ghi DB cũ mang giá trị `SUCCEEDED` và `COMPLETED_WITH_WARNINGS` được `/status` tự động chuẩn hóa hiển thị thành `COMPLETED` / `PARTIAL`.
 
-### Phase statuses / Trạng thái giai đoạn
+### Phase statuses / Trạng thái từng giai đoạn
 
-When events exist, `/status` also shows:
+Khi task có event log chi tiết, `/status` hiển thị tiến độ qua 5 giai đoạn:
 
-1. Project analysis  
-2. Task execution  
-3. Tests and validation  
-4. Post-task audit  
-5. Final report delivery  
+1. `Project analysis`: Khảo sát cấu trúc dự án  
+2. `Task execution`: Thực thi sinh code và chỉnh sửa  
+3. `Tests and validation`: Chạy test suite và kiểm thử  
+4. `Post-task audit`: Audit rà soát an toàn và diff git  
+5. `Final report delivery`: Hoàn tất và gửi báo cáo về Telegram  
 
-Each phase: `PENDING` | `RUNNING` | `COMPLETED` | `FAILED` | `SKIPPED` | `BLOCKED`.
+| Biểu tượng | Trạng thái | Ý nghĩa (VI) | Meaning (EN) |
+|---|---|---|---|
+| ⬜ | `PENDING` | Chưa bắt đầu. | Phase not started yet. |
+| ▶️ | `RUNNING` | Đang chạy giai đoạn này. | Phase currently executing. |
+| ✅ | `COMPLETED` | Giai đoạn hoàn thành tốt. | Phase completed successfully. |
+| ❌ | `FAILED` | Giai đoạn thất bại. | Phase failed. |
+| ⏭️ | `SKIPPED` | Được bỏ qua (ví dụ: mode ANALYSIS bỏ qua phase test/audit). | Skipped (e.g. ANALYSIS mode skips test/audit). |
+| 🚫 | `BLOCKED` | Bị chặn thực thi. | Phase blocked. |
 
 ### Worker recovery / Khôi phục worker
 
@@ -547,8 +565,8 @@ stateDiagram-v2
 | Stuck `RUNNING` | Process died mid-task | Restart bot → orphan reclaim marks `FAILED` |
 | No report in Telegram | Delivery errors recorded as `REPORT_FAILED` / `PARTIAL` | Check network/token; read SQLite `report_text` |
 | Unauthorized users | Bot replies with permission denied | Add numeric ID to `ALLOWED_TELEGRAM_USER_IDS` |
-| `/projectbuttons` does nothing | Menu entry without handler | Use `/projects` instead |
-| `/clearhistory` crashes | Undefined helper in handler | Use Telegram Clear History UI; avoid the command until fixed |
+| Missing project colors | Custom rules file missing | Default `config/project_colors.json` provided with 10 stacks |
+| Cursor CLI missing on Windows | Bot returns FileNotFoundError | Install Cursor and enable command-line launcher on PATH |
 
 Label: the rows above are based on code inspection and unit tests; not every row was reproduced live in this documentation pass.
 
@@ -565,9 +583,9 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-**English:** As of the last validation in this workspace, `python -m pytest tests/ -q` reported **34 passed** (includes cross-platform helper tests with mocked Windows APIs).
+**English:** As of the last validation in this workspace, `python -m pytest tests/ -q` reported **53 passed** (includes cross-platform helper tests, platform paths, Cursor project opener, Telegram inline project button picker, and status lifecycle helpers with mocked Windows APIs).
 
-**Tiếng Việt:** Ở lần xác minh gần nhất trên workspace này, `python -m pytest tests/ -q` cho **34 passed** (gồm test helper đa nền tảng với API Windows được mock).
+**Tiếng Việt:** Ở lần xác minh gần nhất trên workspace này, `python -m pytest tests/ -q` cho **53 passed** (gồm test helper đa nền tảng, đường dẫn quét, mở dự án bằng Cursor, giao diện nút bấm chọn dự án inline Telegram, và lifecycle task với API Windows được mock).
 
 There is no configured ruff/eslint/black pipeline in-repo.
 

@@ -5,11 +5,19 @@ import logging
 from contextlib import suppress
 
 from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from app.config import load_settings
 from app.handlers.task_commands import (
     open_project_start,
+    open_project_callback,
     build_task_conversation,
     clear_history_command,
     cancel_task,
@@ -21,6 +29,7 @@ from app.handlers.task_commands import (
     start,
     task_status,
     continue_task_message,
+    projects_select_start,
 )
 from app.storage.database import TaskDatabase
 from app.services.agent_worker import worker_loop
@@ -95,7 +104,13 @@ def main() -> None:
     application.add_handler(CommandHandler("clearhistory", clear_history_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("scanprojects", scan_projects_command))
+    application.add_handler(CommandHandler("projectbuttons", projects_select_start))
     application.add_handler(CommandHandler("open", open_project_start))
+    application.add_handler(
+        CallbackQueryHandler(
+            open_project_callback, pattern=r"^(open_project:|open_page:|open_refresh$)"
+        )
+    )
     application.add_handler(build_task_conversation())
     # Plain-text follow-ups outside an active conversation continue in the saved project.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, continue_task_message))
