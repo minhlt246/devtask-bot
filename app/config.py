@@ -37,6 +37,11 @@ class Settings:
     agy_command: str
     agent_timeout_seconds: int
     test_timeout_seconds: int
+    ai_router_policy: str = "balanced"
+    ai_fallback_enabled: bool = True
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+    muse_api_key: str = ""
 
 
 def load_settings() -> Settings:
@@ -59,4 +64,9 @@ def load_settings() -> Settings:
         agy_command=(os.getenv("AGY_COMMAND") or "").strip() or default_agy_command(),
         agent_timeout_seconds=max(60, int(os.getenv("AGENT_TIMEOUT_SECONDS", "1800"))),
         test_timeout_seconds=max(30, int(os.getenv("TEST_TIMEOUT_SECONDS", "300"))),
+        ai_router_policy=os.getenv("AI_ROUTER_POLICY", "balanced").strip().lower(),
+        ai_fallback_enabled=os.getenv("AI_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes"),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        muse_api_key=os.getenv("MUSE_API_KEY", "").strip(),
     )

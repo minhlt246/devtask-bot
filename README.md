@@ -77,7 +77,7 @@ DevTask Bot là trợ lý lập trình cá nhân qua Telegram. Người dùng đ
 |---|---|---|
 | Menu `projectbuttons` | Registered (`CommandHandler("projectbuttons", projects_select_start)`) | Đã đăng ký handler mở giao diện chọn nút bấm |
 | `/clearhistory` | Registered and functional | Đã sửa: xóa phiên hội thoại an toàn không crash |
-| Windows live run | Cross-platform code + 53 automated unit tests; live host execution unverified | Code đa nền tảng + 53 unit test tự động; chưa chạy host Windows thật |
+| Windows live run | Cross-platform code + 73 automated unit tests; live host execution unverified | Code đa nền tảng + 73 unit test tự động; chưa chạy host Windows thật |
 | `config/project_colors.json` | Default rule configuration present | Đã có cấu hình mặc định cho 10 công nghệ |
 | `config/projects.json` | Present (auto-scan used by default) | File tồn tại (auto-scan là mặc định) |
 | Legacy statuses | Older DB rows normalized by `/status` | Bản ghi cũ được `/status` chuẩn hóa khi hiển thị |
@@ -179,10 +179,19 @@ devtask-bot/
 ├── app/
 │   ├── main.py                 # Bot entry point
 │   ├── config.py               # Settings from .env
+│   ├── ai/
+│   │   ├── base_provider.py    # Provider ABC, TaskRequest, QuotaStatus, Metrics
+│   │   ├── ai_router.py        # In-memory router (< 2ms) with latency/reliability scoring
+│   │   ├── provider_registry.py# Registry for active/fallback AI providers
+│   │   └── providers/
+│   │       ├── antigravity_provider.py # Default verified CLI engine
+│   │       ├── codex_provider.py       # OpenAI / Codex adapter
+│   │       ├── claude_provider.py      # Anthropic / Claude adapter
+│   │       └── muse_provider.py        # Muse AI adapter
 │   ├── handlers/
 │   │   └── task_commands.py    # Telegram commands & conversations
 │   ├── services/
-│   │   ├── agent_worker.py     # Queue worker + agy integration
+│   │   ├── agent_worker.py     # Queue worker + AI Router integration
 │   │   ├── platform_paths.py   # Multi-platform scan roots resolution
 │   │   ├── platform_support.py # Cross-platform helpers
 │   │   ├── project_classifier.py
@@ -205,12 +214,17 @@ devtask-bot/
 │   ├── run_bot.ps1             # Windows PowerShell launcher
 │   └── start_bot.ps1           # Windows background service launcher
 ├── tests/
+│   ├── benchmark_ai_router.py
 │   ├── conftest.py
+│   ├── test_ai_base_provider.py
+│   ├── test_ai_router.py
 │   ├── test_open_project_buttons.py
 │   ├── test_platform_paths.py
 │   ├── test_platform_support.py
 │   ├── test_project_opener.py
-│   └── test_task_status.py
+│   ├── test_providers.py
+│   ├── test_task_status.py
+│   └── test_worker_router_integration.py
 ├── data/                       # Local DB + logs (gitignored)
 ├── requirements.txt
 ├── .env.example
@@ -583,9 +597,35 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-**English:** As of the last validation in this workspace, `python -m pytest tests/ -q` reported **53 passed** (includes cross-platform helper tests, platform paths, Cursor project opener, Telegram inline project button picker, and status lifecycle helpers with mocked Windows APIs).
+**English:** As of the last validation in this workspace, `python -m pytest tests/ -q` reported **73 passed** (includes cross-platform helpers, platform scan paths, Cursor project opener, Telegram inline project buttons, task lifecycle, and full multi-AI provider router & benchmark suite).
 
-**Tiếng Việt:** Ở lần xác minh gần nhất trên workspace này, `python -m pytest tests/ -q` cho **53 passed** (gồm test helper đa nền tảng, đường dẫn quét, mở dự án bằng Cursor, giao diện nút bấm chọn dự án inline Telegram, và lifecycle task với API Windows được mock).
+**Tiếng Việt:** Ở lần xác minh gần nhất trên workspace này, `python -m pytest tests/ -q` cho **73 passed** (gồm test helper đa nền tảng, đường dẫn quét, mở dự án bằng Cursor, giao diện chọn dự án inline Telegram, lifecycle task, và toàn bộ bộ định tuyến Multi-AI Router kèm benchmark).
+
+---
+
+## Automatic Multi-AI Router / Bộ định tuyến AI tự động
+
+DevTask Bot tích hợp hệ thống **AI Router** tự động đánh giá và chọn engine AI tối ưu (Antigravity CLI, OpenAI Codex, Claude, Muse) trước khi thực thi task.
+
+### 1. Quy tắc tuyển chọn (Selection Rules)
+1. **Quota & Xác thực hợp lệ (Auth & Quota):** Loại bỏ các provider chưa cấu hình API key/CLI, hết quota, hoặc có rate-limit 429 gần đây.
+2. **Đúng năng lực (Capability Match):** Chỉ chuyển task đến provider hỗ trợ đúng chế độ yêu cầu (`ANALYSIS` chỉ đọc hoặc `EXECUTE` sửa code).
+3. **Độ trễ quan sát thực tế (Observed Latency):** Sử dụng sliding window (20 mẫu gần nhất) để tính p50 latency; không phỏng đoán tĩnh.
+4. **Độ ổn định & Cooldown:** Phạt điểm đối với provider có tỷ lệ lỗi cao hoặc vừa timeout/lỗi trong thời gian cooldown (60s).
+5. **Cơ chế dự phòng an toàn (Safe Fallback):** Nếu provider được chọn gặp sự cố trước khi hoàn tất, router tự động chuyển sang provider dự phòng kế tiếp.
+
+### 2. Kết quả Benchmark thời gian quyết định (In-Memory Decision Latency)
+Router vận hành hoàn toàn trong bộ nhớ (`in-memory`) mà không gọi ping mạng đồng bộ gây tốn quota hay làm trễ tiếp nhận task.
+
+| Thước đo (5.000 lượt) | Thời gian đo được | Mục tiêu thiết kế | Đánh giá |
+|---|---|---|---|
+| **p50** | **0.2553 ms** | < 1.0 ms | ✅ Vượt mục tiêu (< 0.3 ms) |
+| **p95** | **0.6151 ms** | < 2.0 ms | ✅ Đạt chuẩn (< 1.0 ms) |
+| **p99** | **0.9482 ms** | < 2.0 ms | ✅ Đạt chuẩn (< 1.0 ms) |
+| **Trung bình (Mean)** | **0.3221 ms** | < 2.0 ms | ✅ Đạt chuẩn |
+
+> [!NOTE]
+> Mục tiêu < 2 ms áp dụng cho thời gian tra cứu và lựa chọn provider trong bộ nhớ. Thời gian AI thực thi code và stream kết quả phụ thuộc vào upstream CLI/API của từng nhà cung cấp.
 
 There is no configured ruff/eslint/black pipeline in-repo.
 

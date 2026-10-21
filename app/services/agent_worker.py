@@ -13,6 +13,13 @@ from app.services.platform_support import resolve_argv, split_command
 from app.services.project_discovery import default_scan_roots, discover_projects
 from app.services.task_status import format_task_status, normalize_status
 from app.storage.database import TaskDatabase
+from app.ai.ai_router import AIRouter, RouterPolicy
+from app.ai.base_provider import TaskRequest, ExecutionResult
+from app.ai.provider_registry import ProviderRegistry
+from app.ai.providers.antigravity_provider import AntigravityProvider
+from app.ai.providers.claude_provider import ClaudeProvider
+from app.ai.providers.codex_provider import CodexProvider
+from app.ai.providers.muse_provider import MuseProvider
 
 log = logging.getLogger(__name__)
 
@@ -267,6 +274,23 @@ def _decide_execute_status(
     return "COMPLETED"
 
 
+def init_ai_router(settings) -> AIRouter:
+    registry = ProviderRegistry()
+    registry.register(AntigravityProvider(agy_command=getattr(settings, "agy_command", None)))
+    registry.register(CodexProvider(api_key=getattr(settings, "openai_api_key", "")))
+    registry.register(ClaudeProvider(api_key=getattr(settings, "anthropic_api_key", "")))
+    registry.register(MuseProvider(api_key=getattr(settings, "muse_api_key", "")))
+    try:
+        policy = RouterPolicy(getattr(settings, "ai_router_policy", "balanced"))
+    except (ValueError, TypeError):
+        policy = RouterPolicy.BALANCED
+    return AIRouter(
+        registry=registry,
+        policy=policy,
+        fallback_enabled=getattr(settings, "ai_fallback_enabled", True),
+    )
+
+
 async def process_one(application, task: dict) -> None:
     db: TaskDatabase = application.bot_data["database"]
     settings = application.bot_data["settings"]
@@ -298,12 +322,41 @@ async def process_one(application, task: dict) -> None:
             raise PermissionError("Dự án không còn nằm trong danh sách phát hiện hợp lệ.")
 
         mode_label = "ĐỌC HIỂU DỰ ÁN · CHỈ ĐỌC" if mode == "ANALYSIS" else "TRIỂN KHAI TASK"
+
+        router: AIRouter = application.bot_data.setdefault("ai_router", init_ai_router(settings))
+        command = split_command(settings.agy_command)
+        if not command:
+            raise RuntimeError("AGY_COMMAND đang để trống.")
+        prompt = _agent_prompt(mode, project_name, resolved, user_request)
+
+        task_req = TaskRequest(
+            task_id=task_id,
+            mode=mode,
+            project_name=project_name,
+            project_path=resolved,
+            user_request=user_request,
+            prompt=prompt,
+            timeout_seconds=settings.agent_timeout_seconds,
+        )
+        decision = router.route_task(task_req)
+        if not decision.selected_provider:
+            reasons = "; ".join(f"{k}: {v}" for k, v in decision.rejections.items())
+            raise RuntimeError(f"Không có AI provider nào khả dụng ({reasons})")
+
+        selected_provider = decision.selected_provider
+        record_event(
+            "AI_ROUTED",
+            f"AI Router đã chọn {selected_provider.name} "
+            f"(score: {decision.score:.1f}, p50 latency: {selected_provider.metrics.median_latency():.2f}s, "
+            f"thời gian routing: {decision.decision_latency_ms:.2f}ms)"
+        )
+
         # Reuse the QUEUED confirmation message so it cannot remain stale.
         status_chat_id = task.get("status_chat_id")
         status_message_id = task.get("status_message_id")
         initial_text = (
             f"🚀 TASK-{task_id:04d} — RUNNING\n"
-            f"Giai đoạn: Khởi chạy Antigravity\n"
+            f"AI: {selected_provider.name} | Giai đoạn: Khởi chạy\n"
             f"Dự án: {project_name}\nChế độ: {mode_label}\n\n"
             "📡 Đang thu thập log thực tế; phát hiện file chỉ phản ánh thay đổi snapshot."
         )
@@ -323,7 +376,7 @@ async def process_one(application, task: dict) -> None:
 
         async def report_live_log(tail: str) -> None:
             nonlocal last_progress_text, last_event_at
-            body = f"🔵 TASK-{task_id:04d} — {mode_label}\nDự án: {project_name}\n\n{tail[-2800:]}"
+            body = f"🔵 TASK-{task_id:04d} — {mode_label} ({selected_provider.name})\nDự án: {project_name}\n\n{tail[-2800:]}"
             now = time.monotonic()
             if now - last_event_at >= 15:
                 record_event("PROGRESS", tail[-2500:])
@@ -337,24 +390,40 @@ async def process_one(application, task: dict) -> None:
                 if "message is not modified" not in str(exc).lower():
                     log.warning("Cannot update live log for task %s: %s", task_id, exc)
 
-        command = split_command(settings.agy_command)
-        if not command:
-            raise RuntimeError("AGY_COMMAND đang để trống.")
-        prompt = _agent_prompt(mode, project_name, resolved, user_request)
-
         if mode == "ANALYSIS":
-            set_step("Project analysis", "ANALYSIS_STARTED", "Bắt đầu phân tích dự án (chỉ đọc).")
+            set_step("Project analysis", "ANALYSIS_STARTED", f"Bắt đầu phân tích dự án bằng {selected_provider.name} (chỉ đọc).")
             set_step("Project analysis", "EXECUTION_SKIPPED", "Chế độ ANALYSIS — bỏ qua task execution.")
             set_step("Project analysis", "TESTING_SKIPPED", "Chế độ ANALYSIS — bỏ qua kiểm thử tự động.")
             set_step("Project analysis", "AUDIT_SKIPPED", "Chế độ ANALYSIS — bỏ qua post-task audit agent.")
         else:
             set_step("Task execution", "ANALYSIS_SKIPPED", "Chế độ EXECUTE — phân tích nằm trong bước triển khai.")
-            set_step("Task execution", "EXECUTION_STARTED", "Bắt đầu triển khai task.")
+            set_step("Task execution", "EXECUTION_STARTED", f"Bắt đầu triển khai task bằng {selected_provider.name}.")
 
-        code, agent_output = await _run_process(
-            command + ["-p", prompt], resolved, settings.agent_timeout_seconds,
-            on_progress=report_live_log,
-        )
+        if selected_provider.name == "Antigravity":
+            code, agent_output = await _run_process(
+                command + ["-p", prompt], resolved, settings.agent_timeout_seconds,
+                on_progress=report_live_log,
+            )
+        else:
+            exec_res = await selected_provider.execute_task(task_req, on_progress=report_live_log)
+            code, agent_output = exec_res.exit_code, exec_res.output
+
+        # Safe fallback if primary provider failed and fallback enabled
+        if code != 0 and router.fallback_enabled:
+            fallback_decision = router.route_fallback(task_req, failed_providers={selected_provider.name})
+            if fallback_decision and fallback_decision.selected_provider:
+                fallback_p = fallback_decision.selected_provider
+                record_event("AI_FALLBACK", f"Chuyển sang AI dự phòng: {fallback_p.name}")
+                await report_live_log(f"⚠️ {selected_provider.name} không hoàn tất. Thử lại với AI dự phòng {fallback_p.name}...")
+                selected_provider = fallback_p
+                if fallback_p.name == "Antigravity":
+                    code, agent_output = await _run_process(
+                        command + ["-p", prompt], resolved, settings.agent_timeout_seconds,
+                        on_progress=report_live_log,
+                    )
+                else:
+                    fb_res = await fallback_p.execute_task(task_req, on_progress=report_live_log)
+                    code, agent_output = fb_res.exit_code, fb_res.output
         lowered_output = agent_output.casefold()
         denied_without_work = any(
             marker in lowered_output
